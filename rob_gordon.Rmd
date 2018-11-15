@@ -1,0 +1,358 @@
+---
+title: "Rob Gordon Rebalancing Tool"
+output:
+  html_document: 
+    code_folding: hide
+    df_print: kable
+    number_sections: yes
+    theme: cosmo
+    toc: yes
+    toc_float: true 
+    thumbnails: true
+    lightbox: true
+    gallery: false
+    highlight: kate
+editor_options: 
+    chunk_output_type: inline
+---
+
+# Setup R Environment
+```{r, echo=FALSE}
+## Import R Snippets File
+knitr::read_chunk('~/Documents/Github/r_snippets/blogdown.R')
+```
+
+```{r knitr_options, include=TRUE}
+
+```
+```{r}
+## Load Required Libraries & Set Paths
+library(tidyverse)
+library(tidyquant)
+library(lubridate)
+library(timetk)
+library(DT)
+library(PerformanceAnalytics)
+setwd("~/Documents/GitHub/rob_gordon_2018")
+```
+
+
+# Get Stock Data
+```{r}
+stocks <- c("SPY", "IYR", "QQQ", "TLT", "GLD", "IWM", "EEM", "DBC", "EFA")
+stock_data <- tq_get(stocks
+                     , get  = "stock.prices"
+                     , from = Sys.Date() - months(12)
+                     , to = Sys.Date()) 
+stock_data %>% head(10)
+```
+
+# Visualize Stock Prices
+* Kept only 4 symbols in order to fit
+* Will include all in dashboard via interactive filtering
+```{r}
+# using ggplot2
+stock_data %>%
+    filter(symbol %in% c("SPY", "GLD", "QQQ", "DBC")) %>%
+    ggplot(aes(x = date, y = adjusted, color = symbol)) +
+    geom_line(size = 1) +
+    geom_bbands(aes(high = high, low = low, close = close), ma_fun = SMA, n = 5,show.legend=TRUE) + 
+    labs(title = "Daily Stock Prices",
+         x = "", y = "Adjusted Prices", color = "") +
+    facet_wrap(~ symbol, ncol = 2, scales = "free") +
+    scale_y_continuous(labels = scales::dollar) +
+    theme_tq() + 
+    scale_color_tq()
+```
+
+# Calculate Returns{.tabset .tabset-fade}
+## Simple Returns Data
+```{r}
+mo_returns <- stock_data %>% 
+  group_by(symbol) %>%
+  tq_transmute(select = adjusted, 
+                 mutate_fun = periodReturn, 
+                 period     = "monthly", 
+                 col_rename = "returns") 
+
+mo_returns %>% 
+  mutate(returns = round(returns, 6)) %>% 
+  arrange(desc(symbol), desc(date)) %>% datatable(class="compact", options = list(scrollX = TRUE, dom = "tp"))
+
+# simple returns = Rt = [ Pt - Pt-1 ]/ Pt-1
+# simple_returns <- 
+#   stock_data %>% 
+#   group_by(symbol, year = year(date)) %>%
+#   summarise(adjusted = last(adjusted, order_by = year)) %>% 
+#   mutate(return = (adjusted - lag(adjusted, order_by = year)) / lag(adjusted, order_by = year)
+#          , return = round(return, 6)) %>% 
+#   arrange(desc(symbol), desc(year)) 
+#   # %>% filter(symbol == "SPY")
+# datatable(simple_returns, class="compact", options = list(scrollX = TRUE, dom = "tp"))
+```
+
+## Chart: Returns
+* stocks filtered to fit
+```{r}
+mo_returns %>% 
+  filter(symbol %in% c("SPY", "GLD", "QQQ", "DBC")) %>%
+    ggplot(aes(x = date, y = returns, fill = symbol)) +
+    geom_line(aes(color=symbol)) +
+    geom_hline(yintercept = 0, color = palette_light()[[1]]) +
+    scale_y_continuous(labels = scales::percent) +
+    labs(title = " Monthly Returns",
+         subtitle = "stocks limited to fit",
+         y = "Monthly Returns", x = "") + 
+    facet_wrap(~ symbol, ncol = 2,scales = "free") +
+    theme_tq() + 
+    scale_fill_tq()
+```
+
+## Chart: Smoothed Returns
+```{r}
+mo_returns %>% 
+  filter(symbol %in% c("SPY", "GLD", "QQQ", "DBC")) %>%
+    ggplot(aes(x = date, y = returns, fill = symbol)) +
+    geom_smooth(aes(color=symbol),method = 'loess' , formula = y ~ x, se=FALSE) +
+    geom_hline(yintercept = 0, color = palette_light()[[1]]) +
+    scale_y_continuous(labels = scales::percent) +
+    labs(title = " Monthly Returns",
+         subtitle = "stocks limited to fit",
+         y = "Monthly Returns", x = "") + 
+    facet_wrap(~ symbol, ncol = 2,scales = "free") +
+    theme_tq() + 
+    scale_fill_tq()
+```
+
+# Growth of $1000 (6mo){.tabset .tabset-fade}
+## Data Table
+```{r}
+init.investment <- 1000
+growth <- mo_returns %>% arrange(date) %>%
+  mutate(final_value = init.investment * cumprod(1 + returns)) %>%
+  arrange(desc(final_value)) 
+growth %>% filter(date == max(date)) %>% select(-date)
+```
+
+## Visualization
+```{r}
+growth %>% ggplot(aes(x = date, y = final_value, color = symbol)) +
+    geom_line() +
+    # geom_smooth(method = "loess") +
+    labs(title = "Individual Portfolio: Comparing the Growth of $1K",
+         subtitle = "Quickly visualize performance",
+         x = "", y = "Investment Value") +
+    theme_tq() + theme(legend.position = "right") +
+    scale_y_continuous(labels = scales::dollar)
+```
+## winners (top 5)
+```{r}
+growth %>% ungroup() %>% filter(date == max(date)) %>% mutate(rank = row_number()) %>% top_n(5,final_value) %>% select(rank, symbol, final_value)
+```
+
+# Portfolio Optimization
+## Create Time-Series Object for Optimization
+```{r}
+# convert to ts object
+stock_returns <- mo_returns %>% 
+  # filter(symbol %in% c("SPY", "GLD", "QQQ", "DBC")) %>%
+  spread(key = symbol, value = returns) %>%
+  tk_xts(date_var = date) %>% 
+  na.omit()
+```
+## Run Minimum Variance Optimization
+* set objective: risk minimization (variance)
+* contraint 1: invest all funds
+* contrstaint 2: long only
+```{r}
+# Markowitz Optimization involves minimizing the risk(variance) of returns and maximizing returns.
+# https://rdrr.io/cran/PortfolioAnalytics/f/inst/doc/ROI_vignette.pdf
+library(PortfolioAnalytics)
+
+# Loading all suggested packages to fix ROI issue
+# list.of.packages <- c("foreach", "DEoptim", "iterators", "fGarch", "Rglpk", "quadprog", "ROI", "ROI.plugin.glpk", "ROI.plugin.quadprog", "ROI.plugin.symphony", "pso", "GenSA", "corpcor", "testthat", "nloptr", "MASS", "robustbase")
+# new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
+# if(length(new.packages)) install.packages(new.packages)
+
+rm(portf_minvar)
+# Create portfolio object
+portf_minvar <- portfolio.spec(assets = colnames(stock_returns))
+# portf_minvar <- portfolio.spec(assets = colnames(returns.portfolio))
+# Add full investment constraint to the portfolio object
+portf_minvar <- add.constraint(portfolio=portf_minvar, type="full_investment")
+# Add objective to minimize variance
+portf_minvar <- add.objective(portfolio=portf_minvar, type="risk", name="var")
+# Add long only constraints
+portf_minvar <- add.constraint(portfolio=portf_minvar, type="box", min=0, max=1)
+ # Run the optimization
+opt_gmv <- optimize.portfolio(R=stock_returns, portfolio=portf_minvar, optimize_method="ROI", trace=TRUE)
+print(opt_gmv, digits = 5)
+#summary(opt_gmv)
+print("Optimal Weights") 
+wts <- opt_gmv['weights'] %>% as.data.frame() %>% 
+  mutate(.,symbol = rownames(.)) %>% select(symbol, weights)
+wts
+```
+
+# Visualize Portfolio Optimization
+```{r, echo=FALSE, warning=FALSE}
+weights <- wts$weights %>% as.vector()
+symbols <- wts$symbol %>% as.vector()
+principal <- 10000
+portfolio_growth_monthly <- mo_returns %>%
+  # filter(symbol %in% c("DBC", "GLD", "QQQ", "SPY")) %>% 
+    tq_portfolio(assets_col   = symbol, 
+                 returns_col  = returns, 
+                 weights      = weights, 
+                 col_rename   = "investment.growth",
+                 wealth.index = TRUE) %>%
+    mutate(investment.growth = investment.growth * principal)
+
+portfolio_growth_monthly %>%
+    ggplot(aes(x = date, y = investment.growth)) +
+    geom_line(size = 2, color = palette_light()[[1]]) +
+    labs(title = "Optimized Portfolio Growth",
+         subtitle = "",
+         caption = "Now we can really visualize performance!",
+         x = "", y = "Portfolio Value") +
+    geom_smooth(method = "loess") +
+    theme_tq() +
+    scale_color_tq() +
+    scale_y_continuous(labels = scales::dollar)
+
+# opt_gmv %>% chart.RiskReward()
+# opt_gmv %>% chart.EfficientFrontier(n.portfolios = 1)
+# opt_gmv %>% chart.Weights()
+# opt_gmv %>% chart.RiskBudget()
+```
+
+# BACKTEST
+## Get Historical Stock Returns (3 Years)
+```{r}
+hist_returns <- tq_get(stocks
+                     , get  = "stock.prices"
+                     , from = Sys.Date() - months(36)
+                     , to = Sys.Date()) %>% 
+  group_by(symbol) %>%
+  tq_transmute(select = adjusted, 
+                 mutate_fun = periodReturn, 
+                 period     = "monthly", 
+                 col_rename = "returns") %>% 
+  spread(key = symbol, value = returns) %>%
+  tk_xts(date_var = date) %>% 
+  na.omit()
+```
+
+## Perform Backtest
+```{r}
+# https://rdrr.io/cran/PortfolioAnalytics/f/inst/doc/ROI_vignette.pdf
+bt_gmv <- optimize.portfolio.rebalancing(R=hist_returns, portfolio=portf_minvar,
+                                         optimize_method="ROI",
+                                         rebalance_on="months",
+                                         training_period=36-6)
+
+print(bt_gmv) 
+```
+
+`r library(dplyr, PerformanceAnalytics)`
+# Get Performance {.tabset .tabset-fade}
+## descriptive statistics 
+`r mo_returns %>% tidyquant::tq_performance(Ra = returns, Rb = NULL, performance_fun = table.Stats)`
+## annualized returns
+`r mo_returns %>% tidyquant::tq_performance(Ra = returns, Rb = NULL, performance_fun = table.AnnualizedReturns)`
+## downside risks
+`r mo_returns %>% tidyquant::tq_performance(Ra = returns, Rb = NULL, performance_fun = table.DownsideRisk)`
+## downside risk ratios
+`r mo_returns %>% tidyquant::tq_performance(Ra = returns, Rb = NULL, performance_fun = table.DownsideRiskRatio)`
+## value at risk
+`r mo_returns %>% tidyquant::tq_performance(Ra = returns, Rb = NULL, performance_fun = VaR)`
+## sharpe ratio
+`r mo_returns %>% tidyquant::tq_performance(Ra = returns, Rb = NULL, performance_fun = SharpeRatio)`
+
+# Appendix
+## Resources & Notes
+* [Performance Analysis Vignette](https://cran.r-project.org/web/packages/tidyquant/vignettes/TQ05-performance-analysis-with-tidyquant.html)
+* [Really great article I walked through](https://rstudio-pubs-static.s3.amazonaws.com/333431_8a130f2ff7f84e4faee2a4ac01d6c30e.html)
+* [Really great article #2 - same as above or extended?](https://rpubs.com/mr148/333431)
+* [Backtesting 4 Portfolio Optimization Strategies In R](https://seekingalpha.com/article/4166115-backtesting-4-portfolio-optimization-strategies-r)
+* [Using ROI Solvers for Portfolio Analytics, Vignette](https://rdrr.io/cran/PortfolioAnalytics/f/inst/doc/ROI_vignette.pdf)
+
+## [Example of Efficiency Frontier from Stack Overflow](https://stackoverflow.com/questions/30614457/r-portfolio-analytics-chart-efficientfrontier-function/30650972#30650972)
+```{r}
+library(PortfolioAnalytics)
+  returns <- stock_returns
+#  define moment function
+  annualized.moments <- function(R, scale=12, portfolio=NULL){
+    out <- list()
+    out$mu <-    matrix(colMeans(R), ncol=1)
+    out$sigma <- cov(R)/scale
+    return(out)
+  }
+# define portfolio
+  prt <- portfolio.spec(assets=colnames(stock_returns))
+  prt <- add.constraint(portfolio=prt, type="long_only")
+  #  leverage defaults to weight_sum = 1 so is equivalent to full_investment constraint
+  prt <- add.constraint(portfolio=prt, type="leverage")
+  prt <- add.objective(portfolio=prt, type="risk", name="StdDev")
+# calculate and plot efficient frontier
+  prt_ef <- create.EfficientFrontier(R=12*stock_returns, portfolio=prt, type="mean-StdDev", 
+                                      match.col = "StdDev", momentFUN="annualized.moments", scale=12)
+  xlim <- range(prt_ef$frontier[,2])*c(1, 1.5)
+  ylim <- range(prt_ef$frontier[,1])*c(.80, 1.05)
+  chart.EfficientFrontier(prt_ef, match.col="StdDev", chart.assets = FALSE, 
+                          labels.assets = FALSE, xlim=xlim, ylim=ylim )
+  points(with(annualized.moments(12*stock_returns, scale=12), cbind(sqrt(diag(sigma)), mu)), pch=19 ) 
+  text(with(annualized.moments(12*stock_returns, scale=12), cbind(sqrt(diag(sigma)), mu)), 
+       labels=colnames(returns), cex=.8, pos=4) 
+  chart.EF.Weights(prt_ef, match.col="StdDev")
+```
+
+## [Second EF Example from Stack Overflow](https://stackoverflow.com/questions/30614457/r-portfolio-analytics-chart-efficientfrontier-function/30650972#30650972)
+```{r}
+require(quadprog) 
+#min_x(-d^T x + 1/2 b^T D x) r.t A.x>=b
+MV_QP<-function(nx, tarRet, Sig=NULL,long_only=FALSE){
+  if (is.null(Sig)) Sig=cov(nx)
+  dvec=rep(0,ncol(Sig))
+  meq=2
+  Amat=rbind(rep(1,ncol(Sig)),
+             apply(nx,2,mean) )
+  bvec=c(1,tarRet )
+  if (long_only) {
+    meq=1
+    Amat=Amat[-1,]
+    Amat=rbind(Amat,
+               diag(1,ncol(Sig)),
+               rep(1,ncol(Sig)),
+               rep(-1,ncol(Sig)))
+    bvec=bvec[-1]
+    bvec=c(bvec,
+               rep(0,ncol(Sig)),.98,-1.02)
+  }
+  sol  <- solve.QP(Dmat=Sig, dvec, t(Amat), bvec, meq=meq)$solution 
+}
+
+steps=50
+x=returns
+ µ.b <- apply(X = x, 2, FUN = mean) 
+long_only=TRUE
+range.bl <- seq(from = min(µ.b), to = max(µ.b)*ifelse(long_only,1,1.6), length.out = steps) 
+risk.bl <- t(sapply(range.bl, function(targetReturn) { 
+  w <- MV_QP(x, targetReturn,long_only=long_only) 
+  c(sd(x %*% w),w)  }))
+
+weigthsl=round(risk.bl[,-1],4)
+colnames(weigthsl)=colnames(x)
+weigthsl %>% head()
+risk.bl=risk.bl[,1]
+rets.bl= weigthsl%*%µ.b
+fan=12
+plot(x = risk.bl*fan^.5, y = rets.bl*fan,col=2,pch=21,
+     xlab = "Annualized Risk ", 
+     ylab = "Annualized Return", main = "long only EF with solve.QP")
+```
+
+## Example - Multi Layer Optimization
+```{r}
+# demo(multi_layer_optimization)
+```
