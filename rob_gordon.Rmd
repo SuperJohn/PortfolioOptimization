@@ -33,6 +33,9 @@ library(lubridate)
 library(timetk)
 library(DT)
 library(PerformanceAnalytics)
+library(ROI.plugin.quadprog)
+library(ROI.plugin.glpk)
+# library(ROI.plugin.symphony)
 setwd("~/Documents/GitHub/rob_gordon_2018")
 ```
 
@@ -147,7 +150,20 @@ growth %>% ggplot(aes(x = date, y = final_value, color = symbol)) +
 ```
 ## winners (top 5)
 ```{r}
-growth %>% ungroup() %>% filter(date == max(date)) %>% mutate(rank = row_number()) %>% top_n(5,final_value) %>% select(rank, symbol, final_value)
+winners <- growth %>% ungroup() %>% filter(date == max(date)) %>% mutate(rank = row_number()) %>% top_n(5,final_value) %>% select(rank, symbol, final_value)
+
+winners %>% arrange(desc(final_value)) %>% 
+ggplot(aes(x = symbol, y = final_value, fill = symbol)) +
+    geom_bar(stat = "identity") +
+    # geom_smooth(method = "loess") +
+    labs(title = "Individual Portfolio: Comparing the Growth of $1K",
+         subtitle = "Quickly visualize performance",
+         x = "", y = "Investment Value") +
+    theme_tq() + theme(legend.position = "right") +
+    scale_y_continuous(labels = scales::dollar) + 
+    geom_text(aes(label = round(final_value,2), vjust = 3, size = 10))
+
+winners$symbol
 ```
 
 # Portfolio Optimization
@@ -155,7 +171,29 @@ growth %>% ungroup() %>% filter(date == max(date)) %>% mutate(rank = row_number(
 ```{r}
 # convert to ts object
 stock_returns <- mo_returns %>% 
-  # filter(symbol %in% c("SPY", "GLD", "QQQ", "DBC")) %>%
+  filter(symbol %in% winners$symbol) %>%
+  spread(key = symbol, value = returns) %>%
+  tk_xts(date_var = date) %>% 
+  na.omit()
+
+#stock_returns %>% class()
+```
+
+# Optimize & BACKTEST
+## Get Historical Stock Returns (3 Years)
+```{r}
+hist_returns <- tq_get(winners$symbol
+                     , get  = "stock.prices"
+                     , from = Sys.Date() - months(36)
+                     , to = Sys.Date()) %>% 
+  group_by(symbol) %>%
+  tq_transmute(select = adjusted, 
+                 mutate_fun = periodReturn, 
+                 period = "daily",
+                 type = "arithmetic",
+                 col_rename = "returns") 
+
+hist_returns_ts <- hist_returns %>% 
   spread(key = symbol, value = returns) %>%
   tk_xts(date_var = date) %>% 
   na.omit()
@@ -174,84 +212,128 @@ library(PortfolioAnalytics)
 # new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
 # if(length(new.packages)) install.packages(new.packages)
 
-rm(portf_minvar)
-# Create portfolio object
-portf_minvar <- portfolio.spec(assets = colnames(stock_returns))
-# portf_minvar <- portfolio.spec(assets = colnames(returns.portfolio))
+#' Set up initial portfolio with basic constraints.
+init.portf <- portfolio.spec(assets = colnames(hist_returns_ts))
 # Add full investment constraint to the portfolio object
-portf_minvar <- add.constraint(portfolio=portf_minvar, type="full_investment")
-# Add objective to minimize variance
-portf_minvar <- add.objective(portfolio=portf_minvar, type="risk", name="var")
+init.portf <- add.constraint(portfolio=init.portf, type="full_investment")
 # Add long only constraints
-portf_minvar <- add.constraint(portfolio=portf_minvar, type="box", min=0, max=1)
- # Run the optimization
-opt_gmv <- optimize.portfolio(R=stock_returns, portfolio=portf_minvar, optimize_method="ROI", trace=TRUE)
-print(opt_gmv, digits = 5)
-#summary(opt_gmv)
-print("Optimal Weights") 
-wts <- opt_gmv['weights'] %>% as.data.frame() %>% 
-  mutate(.,symbol = rownames(.)) %>% select(symbol, weights)
-wts
+init.portf <- add.constraint(portfolio=init.portf, type="box", min_sum=0.99, max_sum=1.01)
+
+# Add objective to minimize variance
+portf_minvar <- add.objective(portfolio=init.portf, type="risk", name="var")
+# Dummy objectives for plotting and/or further analysis
+portf_minvar <- add.objective(portf_minvar, type="return", name="mean", multiplier=0)
+portf_minvar <- add.objective(portf_minvar, type="risk", name="ES", multiplier=0)
+portf_minvar <- add.objective(portf_minvar, type="risk", name="StdDev", multiplier=0)
+
+opt_gmv <- optimize.portfolio(R=hist_returns_ts,
+                              portfolio=portf_minvar,
+                              optimize_method="ROI",
+                              trace=TRUE,
+                              search_size=5000)
+
+### Print Min Variance Achieved via Optimization ###
+extractStats(opt_gmv)[1]
+
+### Print Weights ###
+weights <- extractWeights(opt_gmv)
+weights_tbl <- as.tibble(as.list(weights)) %>% gather("symbol", "weight", 1:length(weights)) %>% arrange(desc(weight))
+weights_tbl
+
+### Bar Chart Weights ###
+opt_gmv %>% chart.Weights(plot.type="barplot", ylim=c(0,1), las=1, colorset = rainbow12equal, main="Optimal Weights", cex.axis = .8 )
+
+### Pie Chart Weights ###
+library(scales)
+pie <- ggplot(weights_tbl, aes(x="", y=weight, fill=symbol)) +
+  geom_bar(width = 1, stat = "identity") + 
+  coord_polar("y", start=0) +
+  scale_fill_brewer("Blues") + #blank_theme() +
+  theme(axis.text.x=element_blank())+
+  geom_text(aes(y = weight/3 + c(0, cumsum(weight)[-length(weight)]), 
+                label = percent(weight)), size=5)
+pie
+
+paste("Min Variance Achieved: ", round(opt_gmv$objective_measures$ES,5))
+
+### Chart Risk Reward ### 
+chart.RiskReward(opt_gmv, rp=TRUE, risk.col = "ES", chart.assets=TRUE)
+
+### CALCULATE & PLOT EFFICIENT FRONTIER ### 
+  prt_ef <- create.EfficientFrontier(R=12*hist_returns_ts, portfolio=portf_minvar, type="mean-StdDev", 
+                                      match.col = "StdDev", momentFUN="annualized.moments", scale=12)
+  ### Chart Efficient Frontier ### 
+  xlim <- range(prt_ef$frontier[,2])*c(1, 1.5)
+  ylim <- range(prt_ef$frontier[,1])*c(.80, 1.05)
+  chart.EfficientFrontier(prt_ef, match.col="StdDev", chart.assets = TRUE, n.portfolios = 1000
+                          , labels.assets = TRUE, xlim=xlim, ylim=ylim, main = "Efficient Frontier")
+  points(with(annualized.moments(12*stock_returns, scale=12), cbind(sqrt(diag(sigma)), mu)), pch=19 ) 
+  text(with(annualized.moments(12*stock_returns, scale=12), cbind(sqrt(diag(sigma)), mu)), 
+       labels=colnames(returns), cex=.8, pos=4) 
+  
+  ### Chart EF Weights ###
+  chart.EF.Weights(prt_ef, match.col="StdDev", colorset = rainbow12equal, main = "Efficient Frontier")
 ```
 
 # Visualize Portfolio Optimization
 ```{r, echo=FALSE, warning=FALSE}
-weights <- wts$weights %>% as.vector()
-symbols <- wts$symbol %>% as.vector()
 principal <- 10000
-portfolio_growth_monthly <- mo_returns %>%
-  # filter(symbol %in% c("DBC", "GLD", "QQQ", "SPY")) %>% 
+portfolio_growth_monthly <- hist_returns %>%
     tq_portfolio(assets_col   = symbol, 
                  returns_col  = returns, 
-                 weights      = weights, 
+                 weights      = extractWeights(opt_gmv), 
                  col_rename   = "investment.growth",
                  wealth.index = TRUE) %>%
     mutate(investment.growth = investment.growth * principal)
 
 portfolio_growth_monthly %>%
     ggplot(aes(x = date, y = investment.growth)) +
-    geom_line(size = 2, color = palette_light()[[1]]) +
+    geom_line(size = 1, color = palette_light()[[1]]) +
     labs(title = "Optimized Portfolio Growth",
          subtitle = "",
-         caption = "Now we can really visualize performance!",
+         caption = "Growth of $10k",
          x = "", y = "Portfolio Value") +
-    geom_smooth(method = "loess") +
+    geom_smooth(method = "loess", show.legend = TRUE) +
     theme_tq() +
     scale_color_tq() +
-    scale_y_continuous(labels = scales::dollar)
-
-# opt_gmv %>% chart.RiskReward()
-# opt_gmv %>% chart.EfficientFrontier(n.portfolios = 1)
-# opt_gmv %>% chart.Weights()
-# opt_gmv %>% chart.RiskBudget()
-```
-
-# BACKTEST
-## Get Historical Stock Returns (3 Years)
-```{r}
-hist_returns <- tq_get(stocks
-                     , get  = "stock.prices"
-                     , from = Sys.Date() - months(36)
-                     , to = Sys.Date()) %>% 
-  group_by(symbol) %>%
-  tq_transmute(select = adjusted, 
-                 mutate_fun = periodReturn, 
-                 period     = "monthly", 
-                 col_rename = "returns") %>% 
-  spread(key = symbol, value = returns) %>%
-  tk_xts(date_var = date) %>% 
-  na.omit()
+    scale_y_continuous(labels = scales::dollar) #+ 
+    #geom_text(aes(label = scales::dollar(investment.growth), vjust = 2, size = 2))
 ```
 
 ## Perform Backtest
-```{r}
+```{r, fig.height=10}
 # https://rdrr.io/cran/PortfolioAnalytics/f/inst/doc/ROI_vignette.pdf
-bt_gmv <- optimize.portfolio.rebalancing(R=hist_returns, portfolio=portf_minvar,
-                                         optimize_method="ROI",
-                                         rebalance_on="months",
-                                         training_period=36-6)
 
-print(bt_gmv) 
+bt_gmv <- optimize.portfolio.rebalancing(R=hist_returns_ts, portfolio=portf_minvar,
+                                         optimize_method="ROI",
+                                         trace = TRUE,
+                                         rebalance_on="months",
+                                         training_period=36,
+                                         # trailing_period=trailing, 
+                                         rolling_window = 12
+                                         )
+
+summary(bt_gmv)$annualized_returns[[1]]
+summary(bt_gmv)$annualized_StdDev[[1]]
+
+bt_weights <- summary(bt_gmv)$weights
+bt_ret <- summary(bt_gmv)$portfolio_returns
+
+charts.PerformanceSummary(cbind(bt_ret, opt_gmv$R), main="Optimization Performance", method = "StdDev", wealth.index = TRUE, begin = "axis")
+
+# x <- Return.portfolio(hist_returns_ts, bt_weights, wealth.index = TRUE, verbose = TRUE)
+# chart.CumReturns(x$returns, col=bluemono, begin="axis")
+# chart.StackedBar(x$BOP.Weight)
+# chart.StackedBar(x$BOP.Value)
+
+# CHART BACKTEST WEIGHTS
+bt_gmv %>% chart.Weights(ylim=c(0,1), las=1, main="Optimal Weights", cex.axis = 3 ,cex.legend = 3, col=rainbow12equal) # , legend.loc = "topright"
+
+# ret.bt.gmv <- do.call(cbind, lapply(bt_gmv, function(x) summary(bt_gmv)$portfolio_returns))
+# colnames(ret.bt.gmv) <- c("min ES", "min ES RB", "min ES Eq RB", "stuff", "other stuff")
+
+Rb <- Return.portfolio(hist_returns_ts, weights = c(.2,.2,.2,.2,.2), wealth.index = TRUE, verbose = TRUE)
+chart.RelativePerformance(as.xts(x$returns), as.xts(Rb$returns), colorset = rainbow12equal, main = "Performance Relative to Even Dist")
 ```
 
 `r library(dplyr, PerformanceAnalytics)`
@@ -276,36 +358,10 @@ print(bt_gmv)
 * [Really great article #2 - same as above or extended?](https://rpubs.com/mr148/333431)
 * [Backtesting 4 Portfolio Optimization Strategies In R](https://seekingalpha.com/article/4166115-backtesting-4-portfolio-optimization-strategies-r)
 * [Using ROI Solvers for Portfolio Analytics, Vignette](https://rdrr.io/cran/PortfolioAnalytics/f/inst/doc/ROI_vignette.pdf)
-
-## [Example of Efficiency Frontier from Stack Overflow](https://stackoverflow.com/questions/30614457/r-portfolio-analytics-chart-efficientfrontier-function/30650972#30650972)
-```{r}
-library(PortfolioAnalytics)
-  returns <- stock_returns
-#  define moment function
-  annualized.moments <- function(R, scale=12, portfolio=NULL){
-    out <- list()
-    out$mu <-    matrix(colMeans(R), ncol=1)
-    out$sigma <- cov(R)/scale
-    return(out)
-  }
-# define portfolio
-  prt <- portfolio.spec(assets=colnames(stock_returns))
-  prt <- add.constraint(portfolio=prt, type="long_only")
-  #  leverage defaults to weight_sum = 1 so is equivalent to full_investment constraint
-  prt <- add.constraint(portfolio=prt, type="leverage")
-  prt <- add.objective(portfolio=prt, type="risk", name="StdDev")
-# calculate and plot efficient frontier
-  prt_ef <- create.EfficientFrontier(R=12*stock_returns, portfolio=prt, type="mean-StdDev", 
-                                      match.col = "StdDev", momentFUN="annualized.moments", scale=12)
-  xlim <- range(prt_ef$frontier[,2])*c(1, 1.5)
-  ylim <- range(prt_ef$frontier[,1])*c(.80, 1.05)
-  chart.EfficientFrontier(prt_ef, match.col="StdDev", chart.assets = FALSE, 
-                          labels.assets = FALSE, xlim=xlim, ylim=ylim )
-  points(with(annualized.moments(12*stock_returns, scale=12), cbind(sqrt(diag(sigma)), mu)), pch=19 ) 
-  text(with(annualized.moments(12*stock_returns, scale=12), cbind(sqrt(diag(sigma)), mu)), 
-       labels=colnames(returns), cex=.8, pos=4) 
-  chart.EF.Weights(prt_ef, match.col="StdDev")
-```
+* [Example R Code from Rob via Systematic Investor](https://systematicinvestor.wordpress.com/2012/08/21/adaptive-asset-allocation-sensitivity-analysis/)
+* [Systematic Investor Github with Library](https://github.com/systematicinvestor/SIT)
+* [Article from Rob re: strategy](https://www.bridgewater.com/resources/risk-parity-is-about-balance.pdf)
+* [Moments Lookback WIndow Optimization](https://quantstrattrader.wordpress.com/category/r/)
 
 ## [Second EF Example from Stack Overflow](https://stackoverflow.com/questions/30614457/r-portfolio-analytics-chart-efficientfrontier-function/30650972#30650972)
 ```{r}
