@@ -1,4 +1,4 @@
-# PortfolioOptimization
+# Portfolio Optimization
 
 A demo version of a Shiny Application created for a private client in the financial space. Removed some proprietary functionality to publish publically.
 
